@@ -1,0 +1,39 @@
+name = "edcloudwasm-optimized"
+main = "_worker.js"  # 你的 JS 逻辑代码
+compatibility_date = "2026-09-01"
+minify = true
+# pages中环境变量需要手动填写并重试部署才会生效，worker环境变量和路由自定义域名这些建议直接使用wrangler.toml文件来配置
+# --- worker环境变量配置 ---
+[vars]
+# VLESS 的 UUID
+# UUID = "请使用 wrangler secret put UUID 设置"
+# Trojan 的密码
+# PASSWORD = "请使用 wrangler secret put PASSWORD 设置"
+# SS使用aes128gcm加密的密码
+# SSPASS = "请使用 wrangler secret put SSPASS 设置"
+# S5和HTTP 入站验证用户名 
+# S5HTTPUSER = "请使用 wrangler secret put S5HTTPUSER 设置"
+# S5和HTTP入站验证密码
+# S5HTTPPASS = "请使用 wrangler secret put S5HTTPPASS 设置"
+# 付费worker 可设置cpu时间限制
+#[limits]
+#cpu_ms = 300000
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
+[[rules]]
+type = "CompiledWasm"
+globs = ["**/*.wasm"]
+fallthrough = true
