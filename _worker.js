@@ -31,7 +31,7 @@ const ssAeadEncryptCount = 16;
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
 // ---------------------------------------------------------------------------------
-const urlParamCacheLimit = 20;//URL参数解析结果缓存条数
+const urlParamCacheLimit = 64;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
 //出站socket获取顺序，全局模式下按数组顺序，非全局为：直连>socks>http>https>sstp>turn>turns>nat64>proxyip>finallyProxyHost
 const proxyStrategyOrder = ['socks', 'http', 'https', 'sstp', 'turn', 'turns', 'nat64'];
@@ -91,6 +91,8 @@ const panelHtmlUrl = 'https://1345695.github.io/index-404-html/panel';
 const errorHtmlUrl = 'https://1345695.github.io/index-404-html/';
 let errorHtmlPromise = null;
 const getErrorHtml = () => errorHtmlPromise ||= fetch(errorHtmlUrl).then(r => r.ok ? r.text() : '').catch(() => '');
+const panelHtmlPromiseHolder = {promise: null};
+const getPanelHtml = () => panelHtmlPromiseHolder.promise ||= fetch(panelHtmlUrl).then(r => r.ok ? r.text() : '').catch(() => '');
 const errorResponse = (message) => getErrorHtml().then(html => {
         if (message) html = html.replace(/<body[^>]*>/i, m => m + `<div style="max-width:720px;margin:40px auto;padding:24px;border-radius:12px;background:#fff3f3;color:#b91c1c;font-size:15px;line-height:1.7"><b>配置缺失：</b>${message}</div>`);
         return new Response(html, {status: message ? 503 : 404, headers: {'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store'}});
@@ -143,8 +145,17 @@ const initializeWasm = (env) => {
         setSocks5AuthLenWasm(socks5Pkg.length);
     }
     cachedTemplates = new Array(9);
-    const subUuid = uuid || crypto.randomUUID();
-    const subPassword = password || crypto.randomUUID();
+    /* 凭据未配置时, 订阅ID必须跨重启稳定, 不能用随机UUID(每次isolate重启都变)。
+       从 PASSWORD 派生固定 UUIDv5 形状标识。 */
+    let subUuid = uuid, subPassword = password;
+    if (!subUuid) {
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode('ed-optimized-sub:' + (subPassword || crypto.randomUUID())));
+        const b = new Uint8Array(digest);
+        b[6] = (b[6] & 0x0f) | 0x50, b[8] = (b[8] & 0x3f) | 0x80;  // UUIDv5 形状
+        const h = [...b.slice(0, 16)].map(x => x.toString(16).padStart(2, '0')).join('');
+        subUuid = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+    }
+    if (!subPassword) subPassword = crypto.randomUUID();
     globalThis.subUuid = subUuid;
     const getSecret = (idx) => {
         const len = getSecretStringWasm(idx);
@@ -1382,6 +1393,9 @@ const establishTcpConnection = async (parsedRequest, request) => {
     const cachedResult = urlListCacheDict.get(clean);
     if (cachedResult !== undefined) {
         list = cachedResult.list, speed = cachedResult.speed;
+        /* LRU: 命中后移到队尾, 热点参数不被环形下标误删 */
+        urlListCacheDict.delete(clean);
+        urlListCacheDict.set(clean, cachedResult);
     } else {
         if (clean.length < 6 || clean.length > 1024) {
             list.push({type: 0}, {type: 3}, {type: 3, param: finallyProxyHost});
@@ -1774,17 +1788,18 @@ export default {
         const {uuid, password, user, pass, sspass} = getEnv(env);
         if (url.pathname === '/sub') return await getSub(request, url, uuid);
         if (url.pathname === '/debug-env') {
+            const k = new URL(request.url).searchParams.get('k');
+            if (!password || k !== password) return new Response('forbidden', {status: 403, headers: {'Cache-Control': 'no-store'}});
             const mask = v => v ? `${v.slice(0, 4)}...(${v.length})` : '(empty)';
-            const info = {UUID: mask(uuid), PASSWORD: mask(password), S5HTTPUSER: mask(user), S5HTTPPASS: mask(pass), SSPASS: mask(sspass), hasEnvUUID: !!env.UUID, hasEnvPASSWORD: !!env.PASSWORD, version: '655b6b3+debug'};
+            const info = {UUID: mask(uuid), PASSWORD: mask(password), S5HTTPUSER: mask(user), S5HTTPPASS: mask(pass), SSPASS: mask(sspass), hasEnvUUID: !!env.UUID, hasEnvPASSWORD: !!env.PASSWORD, version: 'debug-v2'};
             return new Response(JSON.stringify(info, null, 2), {headers: {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}});
         }
         /* 未配置 UUID/PASSWORD 时，访问任何 /xxx 都无法构成有效订阅入口；
            直接给配置提示，而不是让空字符串撞根路径或随机 404。 */
         if (!uuid || !password) return errorResponse('未配置 UUID / PASSWORD Secrets，请先在 Cloudflare Worker 的 Variables and Secrets 中添加后再访问订阅。');
         if (url.pathname === `/${uuid}` || url.pathname === `/${password}`) {
-            const panelResponse = await fetch(panelHtmlUrl);
-            if (!panelResponse.ok) throw new Error(`Failed to fetch panel html: ${panelResponse.status}`);
-            let html = await panelResponse.text();
+            let html = await getPanelHtml();
+            if (!html) return errorResponse();
             const map = {UUID: uuid, PASS: password, HTTPPASS: `${user}:${pass}`, SSPASS: sspass, IPLIST: JSON.stringify(ipListAll), ECHDNS: encodeURIComponent(sharedEchDns)};
             html = html.replace(/{{(UUID|PASS|HTTPPASS|SSPASS|IPLIST|ECHDNS)}}/g, (_, k) => map[k]);
             return new Response(html, {headers: {'Content-Type': 'text/html; charset=UTF-8'}});
