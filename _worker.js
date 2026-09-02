@@ -91,7 +91,10 @@ const panelHtmlUrl = 'https://1345695.github.io/index-404-html/panel';
 const errorHtmlUrl = 'https://1345695.github.io/index-404-html/';
 let errorHtmlPromise = null;
 const getErrorHtml = () => errorHtmlPromise ||= fetch(errorHtmlUrl).then(r => r.ok ? r.text() : '').catch(() => '');
-const errorResponse = () => getErrorHtml().then(html => new Response(html, {status: 404, headers: {'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store'}}));
+const errorResponse = (message) => getErrorHtml().then(html => {
+        if (message) html = html.replace(/<body[^>]*>/i, m => m + `<div style="max-width:720px;margin:40px auto;padding:24px;border-radius:12px;background:#fff3f3;color:#b91c1c;font-size:15px;line-height:1.7"><b>配置缺失：</b>${message}</div>`);
+        return new Response(html, {status: message ? 503 : 404, headers: {'Content-Type': 'text/html; charset=UTF-8', 'Cache-Control': 'no-store'}});
+    });
 import wasmModule from './protocol.wasm';
 const instance = new WebAssembly.Instance(wasmModule);
 const {
@@ -1770,6 +1773,9 @@ export default {
         const url = new URL(request.url);
         const {uuid, password, user, pass, sspass} = getEnv(env);
         if (url.pathname === '/sub') return await getSub(request, url, uuid);
+        /* 未配置 UUID/PASSWORD 时，访问任何 /xxx 都无法构成有效订阅入口；
+           直接给配置提示，而不是让空字符串撞根路径或随机 404。 */
+        if (!uuid || !password) return errorResponse('未配置 UUID / PASSWORD Secrets，请先在 Cloudflare Worker 的 Variables and Secrets 中添加后再访问订阅。');
         if (url.pathname === `/${uuid}` || url.pathname === `/${password}`) {
             const panelResponse = await fetch(panelHtmlUrl);
             if (!panelResponse.ok) throw new Error(`Failed to fetch panel html: ${panelResponse.status}`);
