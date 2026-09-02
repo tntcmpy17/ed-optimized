@@ -118,7 +118,7 @@ const getEnv = (env) => {
     };
     return config;
 };
-const initializeWasm = (env) => {
+const initializeWasm = async (env) => {
     const {uuid, password, user, pass} = getEnv(env);
     const cleanUuid = uuid.replace(/-/g, "");
     if (cleanUuid.length === 32) {
@@ -1776,7 +1776,7 @@ const getSub = async (request, url, uuid) => {
 };
 export default {
     async fetch(request, env) {
-        if (!isInitialized) initializeWasm(env);
+        if (!isInitialized) await initializeWasm(env);
         if (request.method === 'POST' && request.headers.get('content-type') === 'application/grpc-web') return handleXwebPost(request);
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
