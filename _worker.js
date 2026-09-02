@@ -1787,13 +1787,6 @@ export default {
         const url = new URL(request.url);
         const {uuid, password, user, pass, sspass} = getEnv(env);
         if (url.pathname === '/sub') return await getSub(request, url, uuid);
-        if (url.pathname === '/debug-env') {
-            const k = new URL(request.url).searchParams.get('k');
-            if (!password || k !== password) return new Response('forbidden', {status: 403, headers: {'Cache-Control': 'no-store'}});
-            const mask = v => v ? `${v.slice(0, 4)}...(${v.length})` : '(empty)';
-            const info = {UUID: mask(uuid), PASSWORD: mask(password), S5HTTPUSER: mask(user), S5HTTPPASS: mask(pass), SSPASS: mask(sspass), hasEnvUUID: !!env.UUID, hasEnvPASSWORD: !!env.PASSWORD, version: 'debug-v2'};
-            return new Response(JSON.stringify(info, null, 2), {headers: {'Content-Type': 'application/json', 'Cache-Control': 'no-store'}});
-        }
         /* 未配置 UUID/PASSWORD 时，访问任何 /xxx 都无法构成有效订阅入口；
            直接给配置提示，而不是让空字符串撞根路径或随机 404。 */
         if (!uuid || !password) return errorResponse('未配置 UUID / PASSWORD Secrets，请先在 Cloudflare Worker 的 Variables and Secrets 中添加后再访问订阅。');
