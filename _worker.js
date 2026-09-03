@@ -1380,8 +1380,7 @@ const getUrlParam = (offset, len) => {
     if (len <= 0) return null;
     return textDecoder.decode(wasmMem.subarray(dataPtr + offset, dataPtr + offset + len));
 };
-const urlListCacheDict = new Map(), urlListCacheKeys = new Array(urlParamCacheLimit);
-let urlListCacheIndex = 0;
+const urlListCacheDict = new Map();
 const establishTcpConnection = async (parsedRequest, request) => {
     let u = request.url, clean = u.slice(u.indexOf('/', 10) + 1), l = clean.length, list = [], speed;
     if (l > 3 && clean.charCodeAt(l - 4) === 47 && clean.charCodeAt(l - 3) === 84 && clean.charCodeAt(l - 2) === 117 && clean.charCodeAt(l - 1) === 110) {
@@ -1393,7 +1392,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
     const cachedResult = urlListCacheDict.get(clean);
     if (cachedResult !== undefined) {
         list = cachedResult.list, speed = cachedResult.speed;
-        /* LRU: 命中后移到队尾, 热点参数不被环形下标误删 */
+        /* 真正的 LRU：Map 队尾代表最近使用，命中后移到队尾。 */
         urlListCacheDict.delete(clean);
         urlListCacheDict.set(clean, cachedResult);
     } else {
@@ -1434,11 +1433,11 @@ const establishTcpConnection = async (parsedRequest, request) => {
                 list.push({type: 3}, {type: 3, param: finallyProxyHost});
             }
         }
-        const oldKey = urlListCacheKeys[urlListCacheIndex];
-        if (oldKey !== undefined) urlListCacheDict.delete(oldKey);
-        urlListCacheKeys[urlListCacheIndex] = clean;
+        /* 超限时淘汰 Map 队首（最久未使用），不再混用环形下标。 */
+        if (urlListCacheDict.size >= urlParamCacheLimit) {
+            urlListCacheDict.delete(urlListCacheDict.keys().next().value);
+        }
         urlListCacheDict.set(clean, {list, speed});
-        urlListCacheIndex = (urlListCacheIndex + 1) % urlParamCacheLimit;
     }
     for (let i = 0; i < list.length; i++) {
         try {
