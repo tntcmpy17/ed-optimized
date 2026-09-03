@@ -1502,12 +1502,17 @@ const manualPipe = async (readable, writable, close, speed) => {
     } catch {offset = 0, close?.()} finally {isReading = false, flushBuffer()}
 };
 const createBufferedTcpWriter = (tcpWriter, close) => {
-    const queue = new Array(2048);
+    // 有限队列 + 可等待背压：避免上游限速时无限堆积内存后突然断开。
+    const maxQueue = 512, resumeQueue = 128;
+    const queue = new Array(maxQueue);
     let head = 0, tail = 0, size = 0, coalesceBuffer = null, drainActive = false, closed = false;
+    const waiters = [];
+    const wake = (ok) => { while (waiters.length && (ok === false || size <= resumeQueue)) waiters.shift()(ok); };
     const closeWriter = () => {
         if (closed) return;
         closed = true;
-        for (let i = 0; i < 2048; i++) queue[i] = null;
+        for (let i = 0; i < maxQueue; i++) queue[i] = null;
+        wake(false);
         close?.();
     };
     const drainQueue = async () => {
@@ -1516,8 +1521,9 @@ const createBufferedTcpWriter = (tcpWriter, close) => {
             while (size > 0 && !closed) {
                 let chunk = queue[head];
                 if (chunk.byteLength >= maxChunkLen) {
-                    queue[head] = null, head = (head + 1) & 2047, size--;
+                    queue[head] = null, head = (head + 1) % maxQueue, size--;
                     await tcpWriter.write(chunk);
+                    wake(true);
                     continue;
                 }
                 let mergedLength = 0;
@@ -1526,21 +1532,26 @@ const createBufferedTcpWriter = (tcpWriter, close) => {
                     chunk = queue[head];
                     if (mergedLength + chunk.byteLength > maxChunkLen) break;
                     coalesceBuffer.set(chunk, mergedLength), mergedLength += chunk.byteLength;
-                    queue[head] = null, head = (head + 1) & 2047, size--;
+                    queue[head] = null, head = (head + 1) % maxQueue, size--;
                 }
                 if (mergedLength > 0) await tcpWriter.write(coalesceBuffer.subarray(0, mergedLength));
+                wake(true);
             }
-        } catch {closeWriter()} finally {drainActive = false}
+        } catch {closeWriter()} finally {drainActive = false; if (!closed && size > 0) drainActive = true, queueMicrotask(drainQueue)}
     };
-    return chunk => {
-        if (closed) return;
-        const data = chunk.constructor === Uint8Array ? chunk : new Uint8Array(chunk);
-        if (!data.byteLength) return;
-        if (size === 2048) return closeWriter();
-        queue[tail] = data, tail = (tail + 1) & 2047, size++;
+    return async chunk => {
+        if (closed) return false;
+        const data = chunk?.constructor === Uint8Array ? chunk : new Uint8Array(chunk);
+        if (!data.byteLength) return true;
+        // 等待队列降到低水位，不再以 128MB 队列满为由直接断开。
+        while (size >= maxQueue && !closed) await new Promise(resolve => waiters.push(resolve));
+        if (closed) return false;
+        queue[tail] = data, tail = (tail + 1) % maxQueue, size++;
         if (!drainActive) drainActive = true, queueMicrotask(drainQueue);
+        return true;
     };
 };
+
 const createAsyncMicrotaskQueue = (consume, close) => {
     const queue = new Array(1024);
     let head = 0, tail = 0, size = 0, drainActive = false, closed = false;
@@ -1627,11 +1638,11 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         state.tcpSocket = tcpResult.socket;
         const tcpWriter = state.tcpSocket.writable.getWriter();
         const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
-        if (payload.byteLength) tcpWriter.write(payload);
+        if (payload.byteLength) await tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
                 await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
-                    if (plain.byteLength) bufferedTcpWriter(plain);
+                    if (plain.byteLength) await bufferedTcpWriter(plain);
                 });
             };
             state.ssResponseSalt?.length && writable.send(state.ssResponseSalt);
