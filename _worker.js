@@ -1677,18 +1677,25 @@ const handleWebSocketConn = async (webSocket, request) => {
     // @ts-ignore
     const earlyData = earlyDataHeader ? Uint8Array.fromBase64(earlyDataHeader, {alphabet: 'base64url'}) : null;
     const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null};
-    let processingQueue = null;
+    let processingQueue = null, closed = false;
     const close = () => {
+        if (closed) return;
+        closed = true;
         try {state.tcpSocket?.close()} catch {}
         try {webSocket.close(1011, 'WebSocket is closed')} catch {}
     };
     const process = (chunk) => {
+        if (closed) return;
         if (state.tcpWriter) return state.tcpWriter(chunk);
         return handleSession(earlyData ? chunk : new Uint8Array(chunk), state, request, webSocket, close, earlyData !== null);
     };
     processingQueue = createAsyncMicrotaskQueue(process, close);
     if (earlyData) processingQueue(earlyData);
     webSocket.addEventListener("message", event => (state.tcpWriter || processingQueue)(event.data));
+    /* 关键修复：客户端断开/平台回收连接时，必须同步关闭上游 TCP socket。
+       此前只监听 error，close 事件（对端主动断开）会泄漏 cloudflare:sockets 连接，
+       长连接代理场景下每次 loadShed/断开都泄漏一个 socket，配额被僵尸连接耗尽。 */
+    webSocket.addEventListener("close", close);
     webSocket.addEventListener("error", close);
 };
 const xwebHeaders = {'Content-Type': 'application/octet-stream', 'grpc-status': '0', 'X-Accel-Buffering': 'no', 'Cache-Control': 'no-store'};
@@ -1791,7 +1798,11 @@ export default {
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
             webSocket.accept({allowHalfOpen: true}), webSocket.binaryType = "arraybuffer";
-            handleWebSocketConn(webSocket, request);
+            /* 错误兜底：处理函数不阻塞 101 返回，异步异常必须 catch，
+               否则 earlyData 解码失败等会成为 unhandled rejection，连接悬挂不释放。 */
+            handleWebSocketConn(webSocket, request).catch(() => {
+                try {webSocket.close(1011, 'internal error')} catch {}
+            });
             return new Response(null, {status: 101, webSocket: clientSocket});
         }
         const url = new URL(request.url);
