@@ -1501,18 +1501,43 @@ const manualPipe = async (readable, writable, close, speed) => {
         }
     } catch {offset = 0, close?.()} finally {isReading = false, flushBuffer()}
 };
+const TCP_WRITE_TIMEOUT_MS = 60_000;
+const TCP_QUEUE_TIMEOUT_MS = 60_000;
+const writeTcpWithTimeout = async (tcpWriter, chunk) => {
+    let timer;
+    const writePromise = Promise.resolve(tcpWriter.write(chunk));
+    // 超时后底层 write 仍可能稍后 reject，提前挂 catch 避免 unhandled rejection。
+    writePromise.catch(() => {});
+    try {
+        return await Promise.race([
+            writePromise,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error("tcp_write_timeout")), TCP_WRITE_TIMEOUT_MS);
+            })
+        ]);
+    } finally {
+        clearTimeout(timer);
+    }
+};
 const createBufferedTcpWriter = (tcpWriter, close) => {
-    // 有限队列 + 可等待背压：避免上游限速时无限堆积内存后突然断开。
+    // 有限队列 + 有限背压等待：上游长时间不可写时主动释放连接，不能无限挂起 Worker。
     const maxQueue = 512, resumeQueue = 128;
     const queue = new Array(maxQueue);
     let head = 0, tail = 0, size = 0, coalesceBuffer = null, drainActive = false, closed = false;
     const waiters = [];
-    const wake = (ok) => { while (waiters.length && (ok === false || size <= resumeQueue)) waiters.shift()(ok); };
-    const closeWriter = () => {
+    const wake = (ok) => {
+        while (waiters.length && (ok === false || size <= resumeQueue)) {
+            const waiter = waiters.shift();
+            clearTimeout(waiter.timer);
+            waiter.resolve(ok);
+        }
+    };
+    const closeWriter = (reason) => {
         if (closed) return;
         closed = true;
         for (let i = 0; i < maxQueue; i++) queue[i] = null;
         wake(false);
+        if (reason) console.log("tcp writer closed:", reason.message || reason);
         close?.();
     };
     const drainQueue = async () => {
@@ -1522,7 +1547,7 @@ const createBufferedTcpWriter = (tcpWriter, close) => {
                 let chunk = queue[head];
                 if (chunk.byteLength >= maxChunkLen) {
                     queue[head] = null, head = (head + 1) % maxQueue, size--;
-                    await tcpWriter.write(chunk);
+                    await writeTcpWithTimeout(tcpWriter, chunk);
                     wake(true);
                     continue;
                 }
@@ -1534,17 +1559,33 @@ const createBufferedTcpWriter = (tcpWriter, close) => {
                     coalesceBuffer.set(chunk, mergedLength), mergedLength += chunk.byteLength;
                     queue[head] = null, head = (head + 1) % maxQueue, size--;
                 }
-                if (mergedLength > 0) await tcpWriter.write(coalesceBuffer.subarray(0, mergedLength));
+                if (mergedLength > 0) await writeTcpWithTimeout(tcpWriter, coalesceBuffer.subarray(0, mergedLength));
                 wake(true);
             }
-        } catch {closeWriter()} finally {drainActive = false; if (!closed && size > 0) drainActive = true, queueMicrotask(drainQueue)}
+        } catch (error) {
+            closeWriter(error);
+        } finally {
+            drainActive = false;
+            if (!closed && size > 0) drainActive = true, queueMicrotask(drainQueue);
+        }
     };
     return async chunk => {
         if (closed) return false;
         const data = chunk?.constructor === Uint8Array ? chunk : new Uint8Array(chunk);
         if (!data.byteLength) return true;
-        // 等待队列降到低水位，不再以 128MB 队列满为由直接断开。
-        while (size >= maxQueue && !closed) await new Promise(resolve => waiters.push(resolve));
+        while (size >= maxQueue && !closed) {
+            const ok = await new Promise(resolve => {
+                const waiter = { resolve, timer: null };
+                waiter.timer = setTimeout(() => {
+                    const index = waiters.indexOf(waiter);
+                    if (index >= 0) waiters.splice(index, 1);
+                    resolve(false);
+                    closeWriter(new Error("tcp_queue_timeout"));
+                }, TCP_QUEUE_TIMEOUT_MS);
+                waiters.push(waiter);
+            });
+            if (!ok || closed) return false;
+        }
         if (closed) return false;
         queue[tail] = data, tail = (tail + 1) % maxQueue, size++;
         if (!drainActive) drainActive = true, queueMicrotask(drainQueue);
@@ -1638,7 +1679,7 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         state.tcpSocket = tcpResult.socket;
         const tcpWriter = state.tcpSocket.writable.getWriter();
         const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
-        if (payload.byteLength) await tcpWriter.write(payload);
+        if (payload.byteLength) await writeTcpWithTimeout(tcpWriter, payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
                 await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
