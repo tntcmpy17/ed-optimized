@@ -31,7 +31,6 @@ const ssAeadEncryptCount = 16;
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
 const TCP_CONNECT_TIMEOUT_MS = 10_000;//单条 TCP 连接超时：黑洞 IP 不再无限挂起（此前 socket.opened 永不 resolve/reject）
-const STRATEGY_TIMEOUT_MS = 12_000;//单个出站策略总超时（覆盖 TCP 连接 + TLS/SOCKS5/STUN/SSTP 握手等所有 await 点）
 // ---------------------------------------------------------------------------------
 const urlParamCacheLimit = 64;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
@@ -1487,11 +1486,7 @@ const establishTcpConnection = async (parsedRequest, request) => {
         try {
             const exec = strategyExecutorMap.get(list[i].type);
             const sub = (list[i].concurrent && Array.isArray(list[i].param)) ? Math.max(1, Math.floor(concurrency / list[i].param.length)) : undefined;
-            /* 关键修复：每个出站策略执行加总超时。TCP 已连接但握手（TLS/SOCKS5/STUN/SSTP）
-               无响应时，exec 内部 await 也会无限挂起；withTimeout 兜底确保整条链路上限可控，
-               超时即抛错进入下一个策略，不再让平台判定 hung 强杀请求。 */
-            const execPromise = list[i].concurrent && Array.isArray(list[i].param) ? concurrentStrategyExec(parsedRequest, list[i].param, exec, sub, list[i].txt) : exec(parsedRequest, list[i].param, undefined, list[i].txt);
-            const socket = await withTimeout(execPromise, STRATEGY_TIMEOUT_MS, 'strategy_timeout');
+            const socket = await (list[i].concurrent && Array.isArray(list[i].param) ? concurrentStrategyExec(parsedRequest, list[i].param, exec, sub, list[i].txt) : exec(parsedRequest, list[i].param, undefined, list[i].txt));
             if (socket) return {socket, speed};
         } catch {}
     }
@@ -1727,11 +1722,11 @@ const handleSession = async (chunk, state, request, writable, close, isEarlyData
         state.tcpSocket = tcpResult.socket;
         const tcpWriter = state.tcpSocket.writable.getWriter();
         const bufferedTcpWriter = createBufferedTcpWriter(tcpWriter, close);
-        if (payload.byteLength) await writeTcpWithTimeout(tcpWriter, payload);
+        if (payload.byteLength) tcpWriter.write(payload);
         if (isSs || state.ssOutbound) {
             state.tcpWriter = async (c) => {
                 await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c), async plain => {
-                    if (plain.byteLength) await bufferedTcpWriter(plain);
+                    if (plain.byteLength) bufferedTcpWriter(plain);
                 });
             };
             state.ssResponseSalt?.length && writable.send(state.ssResponseSalt);
