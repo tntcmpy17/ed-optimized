@@ -30,6 +30,8 @@ const ssAeadEncryptCount = 16;
 // ---------------------------------------------------------------------------------
 /**- **警告**: worker最大支持6，超过6没意义*/
 let concurrency = 4;//socket获取并发数
+const TCP_CONNECT_TIMEOUT_MS = 10_000;//单条 TCP 连接超时：黑洞 IP 不再无限挂起（此前 socket.opened 永不 resolve/reject）
+const STRATEGY_TIMEOUT_MS = 12_000;//单个出站策略总超时（覆盖 TCP 连接 + TLS/SOCKS5/STUN/SSTP 握手等所有 await 点）
 // ---------------------------------------------------------------------------------
 const urlParamCacheLimit = 64;//URL参数解析结果缓存条数
 // ---------------------------------------------------------------------------------
@@ -400,7 +402,31 @@ const addrTypeIs = (hostname) => {
     const char0 = hostname.charCodeAt(0);
     return (char0 - 48) >>> 0 > 9 ? (char0 === 91 ? 4 : 3) : isIPv4(hostname) ? 1 : 3;
 };
-const createConnect = (hostname, port, socketOptions, socket = connect({hostname, port}, socketOptions)) => socket.opened.then(() => socket);
+const createConnect = (hostname, port, socketOptions, socket = connect({hostname, port}, socketOptions)) => {
+    /* 关键修复：connect() 无超时。目标 IP 黑洞（TCP SYN 无响应）时 socket.opened 永远
+       不 resolve 也不 reject，请求无限挂起 → 平台判定 hung 强杀 → 连锁 isolate 崩溃。
+       超时后主动 close socket 并 reject，调用方 catch 后走下一个出站策略。 */
+    let timer = null, timedOut = false;
+    return new Promise((resolve, reject) => {
+        socket.opened.then(() => {
+            clearTimeout(timer);
+            if (timedOut) {
+                try {socket.close()} catch {}
+                reject(new Error('tcp_connect_timeout'));
+            } else {
+                resolve(socket);
+            }
+        }, err => {
+            clearTimeout(timer);
+            reject(err);
+        });
+        timer = setTimeout(() => {
+            timedOut = true;
+            try {socket.close()} catch {}
+            reject(new Error('tcp_connect_timeout'));
+        }, TCP_CONNECT_TIMEOUT_MS);
+    });
+};
 const dohJsonOptions = {headers: {'Accept': 'application/dns-json'}}, dohHeaders = {'content-type': 'application/dns-message'};
 const concurrentDnsResolve = cachedDnsResolve;
 const raceAny = (promises, closeFn) => {
@@ -743,8 +769,7 @@ const createSstpSession = (username, password) => {
         } else if (messageType === 5 || messageType === 7) throw new Error('SSTP aborted');
     };
     const connectSstp = async (hostname, port) => {
-        socket = connect({hostname, port}, {secureTransport: 'on', allowHalfOpen: false});
-        await socket.opened;
+        socket = await createConnect(hostname, port, {secureTransport: 'on', allowHalfOpen: false});
         if (closed) throw new Error('SSTP socket is closed');
         reader = socket.readable.getReader({mode: 'byob'}), writer = socket.writable.getWriter(), serverHost = hostname, serverPort = port;
     };
@@ -1348,7 +1373,8 @@ const connectProxyIp = async (param, limit, txt) => {
         const connectionPromises = resolvedIps.map(ip => {
             const [host, port] = parseHostPort(ip, 443);
             const socket = connect({hostname: host, port});
-            return socket.opened.then(() => socket, err => {
+            /* 统一走 createConnect 超时逻辑，避免 proxyip 直连路径无限挂起 */
+            return createConnect(host, port, undefined, socket).catch(err => {
                 closeSocket(socket);
                 throw err;
             });
@@ -1461,7 +1487,11 @@ const establishTcpConnection = async (parsedRequest, request) => {
         try {
             const exec = strategyExecutorMap.get(list[i].type);
             const sub = (list[i].concurrent && Array.isArray(list[i].param)) ? Math.max(1, Math.floor(concurrency / list[i].param.length)) : undefined;
-            const socket = await (list[i].concurrent && Array.isArray(list[i].param) ? concurrentStrategyExec(parsedRequest, list[i].param, exec, sub, list[i].txt) : exec(parsedRequest, list[i].param, undefined, list[i].txt));
+            /* 关键修复：每个出站策略执行加总超时。TCP 已连接但握手（TLS/SOCKS5/STUN/SSTP）
+               无响应时，exec 内部 await 也会无限挂起；withTimeout 兜底确保整条链路上限可控，
+               超时即抛错进入下一个策略，不再让平台判定 hung 强杀请求。 */
+            const execPromise = list[i].concurrent && Array.isArray(list[i].param) ? concurrentStrategyExec(parsedRequest, list[i].param, exec, sub, list[i].txt) : exec(parsedRequest, list[i].param, undefined, list[i].txt);
+            const socket = await withTimeout(execPromise, STRATEGY_TIMEOUT_MS, 'strategy_timeout');
             if (socket) return {socket, speed};
         } catch {}
     }
