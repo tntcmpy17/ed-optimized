@@ -90,7 +90,18 @@ const textEncoder = new TextEncoder(), textDecoder = new TextDecoder();
 const panelHtmlUrl = 'https://1345695.github.io/index-404-html/panel';
 const errorHtmlUrl = 'https://1345695.github.io/index-404-html/';
 let errorHtmlPromise = null;
-const getErrorHtml = () => errorHtmlPromise ||= fetch(errorHtmlUrl).then(r => r.ok ? r.text() : '').catch(() => '');
+const fallbackErrorHtml = '<!doctype html><html><head><meta charset="utf-8"><title>Not Found</title></head><body><h1>Not Found</h1></body></html>';
+const fetchTextWithTimeout = async (url, timeoutMs = 5000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(url, {signal: controller.signal});
+        return response.ok ? await response.text() : '';
+    } finally {
+        clearTimeout(timer);
+    }
+};
+const getErrorHtml = () => errorHtmlPromise ||= fetchTextWithTimeout(errorHtmlUrl).catch(() => fallbackErrorHtml);
 const panelHtmlPromiseHolder = {promise: null};
 const getPanelHtml = () => panelHtmlPromiseHolder.promise ||= fetch(panelHtmlUrl).then(r => r.ok ? r.text() : '').catch(() => '');
 const errorResponse = (message) => getErrorHtml().then(html => {
@@ -106,7 +117,7 @@ const {
 const wasmMem = new Uint8Array(memory.buffer);
 const wasmRes = new Int32Array(memory.buffer, getResultPtr(), 36);
 const dataPtr = getDataPtr();
-let isInitialized = false, config = null, cachedTemplates = null, strList = null, userAgentSuffix = null;
+let isInitialized = false, initPromise = null, config = null, cachedTemplates = null, strList = null, userAgentSuffix = null;
 const getEnv = (env) => {
     if (config) return config;
     config = {
@@ -172,6 +183,13 @@ const initializeWasm = async (env) => {
         cachedTemplates[i] = i < 5 ? baseTmpl.replaceAll("{{UUID}}", subUuid) : baseTmpl.replaceAll("{{PASSWORD}}", subPassword);
     }
     isInitialized = true;
+};
+const ensureInitialized = (env) => {
+    if (isInitialized) return Promise.resolve();
+    return initPromise ||= initializeWasm(env).catch(error => {
+        initPromise = null;
+        throw error;
+    });
 };
 const binaryAddrToString = (addrType, addrBytes) => {
     if (addrType === 3) return textDecoder.decode(addrBytes);
@@ -1755,7 +1773,11 @@ const handleXwebPost = async (request) => {
             xwebBuffer = value.buffer, used += value.byteLength;
             const payload = new Uint8Array(xwebBuffer, 0, used);
             if (state.tcpWriter) {
-                await state.tcpWriter(payload.slice());
+                const ok = await state.tcpWriter(payload.slice());
+                if (!ok) {
+                    close();
+                    return;
+                }
                 used = 0;
             } else {
                 state.needMore = false;
@@ -1834,7 +1856,7 @@ const getSub = async (request, url, uuid) => {
 };
 export default {
     async fetch(request, env) {
-        if (!isInitialized) await initializeWasm(env);
+        await ensureInitialized(env);
         if (request.method === 'POST' && request.headers.get('content-type') === 'application/grpc-web') return handleXwebPost(request);
         if (request.headers.get('Upgrade') === 'websocket') {
             const {0: clientSocket, 1: webSocket} = new WebSocketPair();
