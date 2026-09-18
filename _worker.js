@@ -478,28 +478,34 @@ const connectViaSocksProxy = async (targetAddrType, targetPortNum, socksAuth, ad
     const socksSocket = await concurrentConnect(socksAuth.hostname, socksAuth.port, limit);
     const writer = socksSocket.writable.getWriter();
     const reader = socksSocket.readable.getReader();
-    await writer.write(new Uint8Array([5, 2, 0, 2]));
-    const {value: authResponse} = await reader.read();
-    if (!authResponse || authResponse[0] !== 5 || authResponse[1] === 0xFF) return null;
-    if (authResponse[1] === 2) {
-        if (!socksAuth.username) return null;
-        const userBytes = textEncoder.encode(socksAuth.username);
-        const passBytes = textEncoder.encode(socksAuth.password || '');
-        const uLen = userBytes.length, pLen = passBytes.length, authReq = new Uint8Array(3 + uLen + pLen)
-        authReq[0] = 1, authReq[1] = uLen, authReq.set(userBytes, 2), authReq[2 + uLen] = pLen, authReq.set(passBytes, 3 + uLen);
-        await writer.write(authReq);
-        const {value: authResult} = await reader.read();
-        if (!authResult || authResult[0] !== 1 || authResult[1] !== 0) return null;
-    } else if (authResponse[1] !== 0) {return null}
-    const isDomain = targetAddrType === 3, socksReq = new Uint8Array(6 + addrBytes.length + (isDomain ? 1 : 0));
-    socksReq[0] = 5, socksReq[1] = 1, socksReq[2] = 0, socksReq[3] = targetAddrType;
-    isDomain ? (socksReq[4] = addrBytes.length, socksReq.set(addrBytes, 5)) : socksReq.set(addrBytes, 4);
-    socksReq[socksReq.length - 2] = targetPortNum >> 8, socksReq[socksReq.length - 1] = targetPortNum & 0xff;
-    await writer.write(socksReq);
-    const {value: finalResponse} = await reader.read();
-    if (!finalResponse || finalResponse[1] !== 0) return null;
-    writer.releaseLock(), reader.releaseLock();
-    return socksSocket;
+    try {
+        await withTimeout(writer.write(new Uint8Array([5, 2, 0, 2])), TCP_CONNECT_TIMEOUT_MS, 'socks write timeout');
+        const {value: authResponse} = await withTimeout(reader.read(), TCP_CONNECT_TIMEOUT_MS, 'socks handshake timeout');
+        if (!authResponse || authResponse[0] !== 5 || authResponse[1] === 0xFF) return null;
+        if (authResponse[1] === 2) {
+            if (!socksAuth.username) return null;
+            const userBytes = textEncoder.encode(socksAuth.username);
+            const passBytes = textEncoder.encode(socksAuth.password || '');
+            const uLen = userBytes.length, pLen = passBytes.length, authReq = new Uint8Array(3 + uLen + pLen)
+            authReq[0] = 1, authReq[1] = uLen, authReq.set(userBytes, 2), authReq[2 + uLen] = pLen, authReq.set(passBytes, 3 + uLen);
+            await withTimeout(writer.write(authReq), TCP_CONNECT_TIMEOUT_MS, 'socks write timeout');
+            const {value: authResult} = await withTimeout(reader.read(), TCP_CONNECT_TIMEOUT_MS, 'socks auth timeout');
+            if (!authResult || authResult[0] !== 1 || authResult[1] !== 0) return null;
+        } else if (authResponse[1] !== 0) {return null}
+        const isDomain = targetAddrType === 3, socksReq = new Uint8Array(6 + addrBytes.length + (isDomain ? 1 : 0));
+        socksReq[0] = 5, socksReq[1] = 1, socksReq[2] = 0, socksReq[3] = targetAddrType;
+        isDomain ? (socksReq[4] = addrBytes.length, socksReq.set(addrBytes, 5)) : socksReq.set(addrBytes, 4);
+        socksReq[socksReq.length - 2] = targetPortNum >> 8, socksReq[socksReq.length - 1] = targetPortNum & 0xff;
+        await withTimeout(writer.write(socksReq), TCP_CONNECT_TIMEOUT_MS, 'socks write timeout');
+        const {value: finalResponse} = await withTimeout(reader.read(), TCP_CONNECT_TIMEOUT_MS, 'socks connect timeout');
+        if (!finalResponse || finalResponse[1] !== 0) return null;
+        writer.releaseLock(), reader.releaseLock();
+        return socksSocket;
+    } catch {
+        try {socksSocket?.close()} catch {}
+        try {writer.releaseLock(), reader.releaseLock()} catch {}
+        return null;
+    }
 };
 const tlsStreamAdapter = (tls, initial = new Uint8Array(0)) => {
     let leftOver = initial, reading = null, closed = false;
@@ -607,7 +613,7 @@ const connectViaHttpProxy = async (targetAddrType, targetPortNum, httpAuth, addr
     const reader = isCustomTls ? null : proxySocket.readable.getReader();
     try {
         while (bytesRead < buffer.length) {
-            const res = isCustomTls ? {value: await tlsClient.read()} : await reader.read();
+            const res = isCustomTls ? {value: await withTimeout(tlsClient.read(), TCP_CONNECT_TIMEOUT_MS, 'http proxy read timeout')} : {value: await withTimeout(reader.read(), TCP_CONNECT_TIMEOUT_MS, 'http proxy read timeout')};
             const value = res.value;
             if (!value) return null;
             const prevBytesRead = bytesRead;
